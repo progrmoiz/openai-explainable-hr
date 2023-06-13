@@ -2,6 +2,10 @@
 # https://hub.docker.com/_/python
 FROM python:3.11-slim
 
+# Add this after your base image specification (e.g., FROM python:3.7-slim)
+RUN apt-get update && \
+    apt-get -y install gcc
+
 # Copy local code to the container image.
 ENV APP_HOME /app
 WORKDIR $APP_HOME

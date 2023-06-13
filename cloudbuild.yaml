@@ -1,12 +1,4 @@
 steps:
-  - name: 'gcr.io/cloud-builders/docker'
-    entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
-        apt-get update && \
-        apt-get -y install gcc
-
   - name: gcr.io/cloud-builders/docker
     args:
       [
