@@ -1,0 +1,17 @@
+Flask==2.2.2
+flask-cors==3.0.10
+giphy_client==1.0.0
+langchain==0.0.146
+pydantic==1.10.2
+supabase==1.0.2
+qdrant-client==1.1.6
+unstructured
+wikipedia
+openai
+wolframalpha
+google-api-python-client
+google-search-results
+python-dotenv
+gunicorn
+pypdf
+tiktoken
