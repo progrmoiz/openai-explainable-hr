@@ -1,52 +1,69 @@
-from qdrant_client import QdrantClient
-from langchain.chains.qa_with_sources import load_qa_with_sources_chain
-from langchain.document_loaders.pdf import BasePDFLoader
-from typing import List
-from langchain.embeddings import CohereEmbeddings
+import datetime
 import json
 import logging
 import os
-import re
-import sys
+import pickle
 
-import langchain
-from flask import Flask, render_template, request, send_from_directory
-from flask_cors import CORS, cross_origin
-
-from langchain import OpenAI, PromptTemplate
-from langchain.cache import InMemoryCache
+import joblib
+import pandas as pd
+from flask import Flask, request
+from flask_cors import CORS
+from langchain import PromptTemplate
 from langchain.chains import LLMChain
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.prompts import FewShotPromptTemplate
-from langchain.prompts.example_selector import \
-    SemanticSimilarityExampleSelector
-from langchain.vectorstores import FAISS
-from langchain.vectorstores import Qdrant
-from langchain.embeddings import OpenAIEmbeddings
-from langchain import VectorDBQA, OpenAI
+from langchain.chains.llm import LLMChain
 from langchain.chat_models import ChatOpenAI
-from langchain.document_loaders import UnstructuredFileLoader, PyPDFLoader
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.document_loaders import WebBaseLoader
+from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+from langchain.prompts import PromptTemplate
+from langchain.output_parsers import OutputFixingParser
 
-from langchain.docstore.document import Document
-from secure import require_apikey
+# convert to dict
+def el_convert_to_dict(explain_local, prediction, simple=False):
+    # A local explanation shows the breakdown of how much each term contributed to 
+    # the prediction for a single sample. The intercept reflects the average case. 
+    # In regression, the intercept is the average y-value of the train set 
+    # (e.g., $5.51 if predicting cost). In classification, the intercept is the 
+    # log of the base rate (e.g., -2.3 if the base rate is 10%). The 15 most 
+    # important terms are shown.
+  
+    # simple only keep without &
+  
+    data = explain_local.data(0)
+    explanation = {}
 
-import random
-import json
-import os
-import urllib.request
-import mimetypes
-# Loading environment variables
-import os
+    # intercept = data['extra']['scores'][0]
 
-import urllib.request
+    for i in range(len(data['names'])):
+        if simple:
+            if '&' in data['names'][i]:
+                continue
+        explanation[data['names'][i]] = data['scores'][i]
 
+    return {
+        # 'call_for_interview': data['perf']['predicted'],
+        'call_for_interview': prediction[0],
+        'explanation': explanation
+    }
+
+def predict(df):
+    filename = os.path.join(os.path.dirname(__file__), "ebm_model.pkl")
+
+    # load the model from disk
+    ebm = pickle.load(open(filename, 'rb'))
+
+    # predict for single data point
+    new_data = df
+
+    prediction = ebm.predict(new_data)
+
+    # explainable local, new_data is the same as above
+    explain_local = ebm.explain_local(new_data)
+
+    # display the explanation, print(explain_local.data) is also possible
+    data = el_convert_to_dict(explain_local, prediction, simple=True)
+
+    return data
 
 # from secure import require_apikey
-
-langchain.llm_cache = InMemoryCache()
 
 logger = logging.getLogger()
 
@@ -63,242 +80,202 @@ if __name__ == '__main__':
 def health():
     return 'It is alive!\n'
 
+resume_analysis_template = """<|im_start|>system
+You are an assessor tasked with evaluating a candidate's resume for a specific job role. Provide a detailed analysis on the following aspects:
 
-# Embedding of a document
+- Years of experience: Calculate the number of years the candidate has spent working in the relevant field, based on the information in their resume, and compare it to the job requirements.
+- Functional competency: Assess the extent to which the candidate's skills, knowledge, and abilities in their resume align with the functional aspects of the job role.
+- Top functional skill: Identify the most important functional skill required for the job and evaluate the candidate's proficiency in that skill.
+- Second most important functional skill: Determine the second most critical functional skill needed for the job and evaluate the candidate's proficiency in that skill.
+- Third most important functional skill: Ascertain the third most essential functional skill necessary for the role and assess the candidate's proficiency in that skill.
+- Behavioral competency: Evaluate the candidate's behavioral skills or soft skills as mentioned in their resume, and examine how well they align with the job role requirements.
+- Top behavioral skill: Identify the most important behavioral skill necessary for the job and gauge the candidate's proficiency in that area.
+- Second most important behavioral skill: Determine the second most crucial behavioral skill needed for the job and evaluate the candidate's proficiency in that skill.
+- Third most important behavioral skill: Ascertain the third most essential behavioral skill required for the role and assess the candidate's proficiency in that skill.
 
+Current date: {current_date}
 
-class PyPDFLoader(BasePDFLoader):
-    """Loads a PDF with pypdf and chunks at character level.
+<|im_end|>
+<|im_start|>user
+■ Resume ■
+{resume}
 
-    Loader also stores page numbers, from_line, and to_line in metadatas.
-    """
+■ Job Requirements ■
+{job_description}
 
-    def __init__(self, file_path: str):
-        """Initialize with file path."""
-        try:
-            import pypdf  # noqa:F401
-        except ImportError:
-            raise ValueError(
-                "pypdf package not found, please install it with " "`pip install pypdf`"
-            )
-        super().__init__(file_path)
+<|im_end|>
+<|im_start|>assistant
+"""
 
-    def load(self) -> List[Document]:
-        """Load given path as pages."""
-        import pypdf
+RESUME_ANALYSIS_PROMPT = PromptTemplate(
+    template=resume_analysis_template, 
+    input_variables=["resume", "job_description", "current_date"],
+)
 
-        with open(self.file_path, "rb") as pdf_file_obj:
-            pdf_reader = pypdf.PdfReader(pdf_file_obj)
-            total_lines = 0
-            documents = []
-            for i, page in enumerate(pdf_reader.pages):
-                from_line = total_lines + 1
-                page_lines = page.extract_text().count("\n") + 1
-                to_line = from_line + page_lines - 1
-                total_lines += page_lines
+resume_score_template = """<|im_start|>system
+Assistant is given with detailed assessment of candidate's resume. Give scores, you always have to output scores. Current date: {current_date}
 
-                documents.append(
-                    Document(
-                        page_content=page.extract_text(),
-                        metadata={
-                            "source": self.file_path,
-                            "page": i,
-                            "from_line": from_line,
-                            "to_line": to_line,
-                        },
-                    )
-                )
-            return documents
+{format_instructions}
 
+<|im_end|>
+<|im_start|>user
+■ Detailed assessment ■
+{assessment}
 
-@app.route('/embed', methods=['POST'])
-@require_apikey
-def embed():
-    try:
-        # Define the file path variable
-        file_path = None
+<|im_end|>
+<|im_start|>assistant
+"""
 
-        body = request.get_json(force=True)
-        if body is None or 'document_id' not in body or 'datastore_id' not in body or 'loader_type' not in body or 'openai_api_key' not in body or 'qdrant_url' not in body or 'qdrant_api_key' not in body:
-            raise ValueError('Invalid request body')
+response_schemas = [
+    ResponseSchema(name="years_of_experience", description="The total number of years the candidate.", type="integer"),
+    ResponseSchema(name="years_of_experience_score", description="A score (1-10) representing the candidate's years of experience.", type="integer"),
+    ResponseSchema(name="functional_competency_score", description="A composite score (1-10) evaluating the candidate's proficiency in all required functional skills.", type="integer"),
+    ResponseSchema(name="top1_skills_score", description="A score (1-10) assessing the candidate's aptitude in the most critical functional skill for the job, determined.", type="integer"),
+    ResponseSchema(name="top2_skills_score", description="A score (1-10) evaluating the candidate's competence in the second most important functional skill for the job.", type="integer"),
+    ResponseSchema(name="top3_skills_score", description="A score (1-10) gauging the candidate's proficiency in the third most significant functional skill for the job.", type="integer"),
+    ResponseSchema(name="behavior_competency_score", description="An aggregated score (1-10) reflecting the candidate's overall performance in required behavioral competencies.", type="integer"),
+    ResponseSchema(name="top1_behavior_skill_score", description="A score (1-10) rating the candidate's mastery of the foremost required behavioral skill.", type="integer"),
+    ResponseSchema(name="top2_behavior_skill_score", description="A score (1-10) appraising the candidate's aptitude in the second most vital behavioral skill.", type="integer"),
+    ResponseSchema(name="top3_behavior_skill_score", description="A score (1-10) measuring the candidate's ability in the third most essential behavioral skill.", type="integer"),
+]
 
-        document_id = body.get('document_id')
-        datastore_id = body.get('datastore_id')
+output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+format_instructions = output_parser.get_format_instructions()
 
-        loader_type = body.get('loader_type')
+RESUME_SCORE_PROMPT = PromptTemplate(
+    template=resume_score_template, 
+    input_variables=["assessment", "current_date"],
+    partial_variables={"format_instructions": format_instructions}
+)
 
-        openai_api_key = body.get('openai_api_key')
-        collection_name = "text-embedding-ada-002"
+write_email_template = """<|im_start|>system
+You are an HR assistant responsible for drafting emails to candidates about their interview status. You have access to a detailed analysis of their resume, the final decision on their application, and an explanation of the various factors that influenced the decision. Your email should:
 
-        qdrant_url = body.get('qdrant_url')
-        qdrant_api_key = body.get('qdrant_api_key')
+Politely greet the candidate.
+Express gratitude for their application.
+Succinctly provide information on the final decision regarding their interview invitation.
+If they are not selected, kindly use the explanation provided to outline the factors that contributed to the decision in a clear and constructive manner.
+Additionally, provide personalized feedback in an ordered bullet list (e.g., 1., 2., 3.) with suggestions on how they can improve their chances for future opportunities based on their resume analysis and the provided explanation.
+If they are selected, provide necessary details, such as the date and time of the interview, along with any additional instructions.
+Thank the candidate again and close the email professionally.
 
-        docs = []
-        if loader_type == "webpage":
-            urls = body.get("urls")
+Please maintain a respectful tone and provide helpful feedback that is tailored to the candidate's application, considering the explanation and resume analysis provided. Present this guidance in an organized, easy-to-read manner with ordered bullet points, enabling them to understand their areas of improvement and increase their chances of success in future applications.
 
-            # loader = WebBaseLoader(["https://www.espn.com/", "https://google.com"])
-            loader = WebBaseLoader(urls)
-            docs = loader.load()
-        elif loader_type == "file":
-            file_url = body.get("file_url")
+Current date: {current_date}
 
-            # Download the file from the url provided
-            folder_path = f'./'
-            # Create the folder if it doesn't exist
-            os.makedirs(folder_path, exist_ok=True)
-            # Filename for the downloaded file
-            filename = file_url.split('/')[-1]
-            # Full path to the downloaded file
-            file_path = os.path.join(folder_path, filename)
+<|im_end|>
+<|im_start|>user
+■ Resume analysis ■
+{resume_analysis}
 
-            import ssl  # not the best for production use to not verify ssl, but fine for testing
-            ssl._create_default_https_context = ssl._create_unverified_context
+■ Final Decision ■
+Call for interview = {call_for_interview} 
 
-            print(file_url)
-            # Download the file and save it to the local folder
-            urllib.request.urlretrieve(file_url, file_path)
+■ Explanations ■
+```json
+{explanations}
+```
 
-            # Checking filetype for document parsing, PyPDF is a lot faster than Unstructured for pdfs.
-            import mimetypes
-            mime_type = mimetypes.guess_type(file_path)[0]
+■ Candidate Name ■
+{candidate_name}
 
-            print(file_path, mime_type)
-            if mime_type == 'application/pdf':
-                loader = PyPDFLoader(file_path)
-                docs = loader.load_and_split()
-            else:
-                loader = UnstructuredFileLoader(file_path)
-                docs = loader.load()
+■ Company Name ■
+{company_name}
 
-        # add metadata to the document
-        for doc in docs:
-            doc.metadata["datastore_id"] = datastore_id
-            doc.metadata["document_id"] = document_id
+<|im_end|>
+<|im_start|>assistant
+"""
 
-        # Generate embeddings
-        embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+WRITE_EMAIL_PROMPT = PromptTemplate(
+    template=write_email_template, 
+    input_variables=["resume_analysis", "candidate_name", "company_name", "call_for_interview", "explanations", "current_date"],
+)
 
-        try:
-            print("Adding to existing collection")
-            client = QdrantClient(
-                url=qdrant_url, prefer_grpc=True, api_key=qdrant_api_key)
-            qdrant = Qdrant(client, collection_name,
-                            embedding_function=embeddings.embed_query)
-            qdrant.add_documents(docs)
-        except:
-            print("Creating new collection")
-            qdrant = Qdrant.from_documents(
-                docs,
-                embeddings,
-                url=qdrant_url,
-                collection_name=collection_name,
-                prefer_grpc=True,
-                api_key=qdrant_api_key,
-            )
+# @require_apikey
 
-        if file_path is not None:
-            os.remove(file_path)  # Delete downloaded file
-        # add metadata to the document
-
-        return {
-            "collection_name": qdrant.collection_name,
-            "datastore_id": datastore_id,
-            "document_id": document_id,
-        }
-    except Exception as e:
-        # Remove the file if it exists
-        try:
-            if file_path is not None:
-                os.remove(file_path)
-        except:
-            pass
-
-        print(e)
-        return {
-            "error": str(e),
-        }
-
-
-# Retrieve information from a collection
-# from langchain.chains.question_answering import load_qa_chain
-# from langchain.llms import OpenAI
-
-# def get_chat_history(inputs) -> str:
-#     res = []
-#     for human, ai in inputs:
-#         res.append(f"Human:{human}\nAI:{ai}")
-#     return "\n".join(res)
-
-
-@app.route('/search', methods=['POST'])
-@require_apikey
-def search():
+@app.route('/explain', methods=['POST'])
+def explain():
     body = request.get_json(force=True)
     # messages_array = body.get('messages') or []
 
-    openai_api_key = body.get('openai_api_key')
-    qdrant_url = body.get('qdrant_url')
-    qdrant_api_key = body.get('qdrant_api_key')
+    resume = body.get('resume')
+    job_description = body.get('position')
+    candidate_name = body.get('candidate_name') or 'Moiz Farooq'
+    company_name = body.get('company_name') or 'App4HR'
 
-    collection_name = "text-embedding-ada-002"
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    # document_id = body.get("document_id")
-    datastore_id = body.get("datastore_id")
-
-    query = body.get("query")
-
-    client = QdrantClient(url=qdrant_url, prefer_grpc=True,
-                          api_key=qdrant_api_key)
-    # chat_history = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-
-    # embeddings = CohereEmbeddings(model="multilingual-22-12", cohere_api_key=cohere_api_key)
-    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-    qdrant = Qdrant(client=client, collection_name=collection_name,
-                    embedding_function=embeddings.embed_query)
-    search_results = qdrant.similarity_search(
-        query,
-        k=5,
-        filter={"datastore_id": datastore_id},
+    llm = ChatOpenAI(temperature=0)
+    llm_chain = LLMChain(
+        llm=llm,
+        prompt=RESUME_ANALYSIS_PROMPT,
+        verbose=True,
     )
 
-    # chain = load_qa_chain(
-    #     ChatOpenAI(openai_api_key=openai_api_key,temperature=0.2),
-    #     chain_type="stuff",
-    #     memory=memory,
-    # )
-    # llm = ChatOpenAI(openai_api_key=openai_api_key, temperature=0.2)
+    assessment = llm_chain.run(resume=resume, job_description=job_description, current_date=current_date)
 
-    # retriever = qdrant.as_retriever()
-    # retriever.search_kwargs = {
-    #     'k': 5,
-    #     'filters': [{ "datastore_id": datastore_id }],
-    # }
+    llm = ChatOpenAI(temperature=0)
+    llm_chain = LLMChain(
+        llm=llm,
+        prompt=RESUME_SCORE_PROMPT,
+        verbose=True,
+    )
 
-    # qa = ConversationalRetrievalChain.from_llm(
-    #     llm=llm,
-    #     retriever=retriever,
-    #     return_source_documents=True,
-    #     get_chat_history=get_chat_history,
-    # )
+    result = llm_chain.run(assessment=assessment, current_date=current_date)
+    
+    final_result = None
 
-    # result = qa({"question": query, "chat_history": chat_history})
+    try:
+        final_result = output_parser.parse(result)
 
-    results = []
-    for document in search_results:
-        results.append({
-            "page_content": document.page_content,
-            "metadata": document.metadata,
-        })
+    except:
+        new_parser = OutputFixingParser.from_llm(parser=output_parser, llm=ChatOpenAI())
+        final_result = new_parser.parse(result)
+    
+    for key in final_result:
+        if final_result[key] is None:
+            final_result[key] = 0
 
-    # print(result)
+    years_of_experience = None
+    if 'years_of_experience_score' in final_result:
+        years_of_experience = final_result['years_of_experience']
+        final_result['years_of_experience'] = final_result['years_of_experience_score']
+        del final_result['years_of_experience_score']
+
+    df = pd.json_normalize(final_result)
+
+    # "2scaler.joblib" is in same directory as this file
+    scaler_filename = os.path.join(os.path.dirname(__file__), "2scaler.joblib")
+    scaler = joblib.load(scaler_filename)
+
+    normalized_new_data = scaler.transform(df)
+
+    columns = df.columns
+    index = df.index
+    df_normalized = pd.DataFrame(data=normalized_new_data, columns=columns, index=index)
+
+    result = predict(df_normalized)
+
+    call_for_interview = "YES" if result['call_for_interview'] == 1 else "NO"
+    explanations = json.dumps(result['explanation'])
+
+    llm = ChatOpenAI(temperature=0)
+    llm_chain = LLMChain(
+        llm=llm,
+        prompt=WRITE_EMAIL_PROMPT,
+        verbose=True,
+    )
+
+    email = llm_chain.run(resume_analysis=assessment, call_for_interview=call_for_interview, explanations=explanations, company_name=company_name, candidate_name=candidate_name, current_date=current_date)
 
     return {
-        "results": results,
+        'call_for_interview': 1 if call_for_interview == "YES" else 0,
+        'explanations': result['explanation'],
+        'email': email
     }
 
 
-@ app.route('/dummy')
+@app.route('/dummy')
 def dummy():
     return {
         'text': 'Hello World!',
